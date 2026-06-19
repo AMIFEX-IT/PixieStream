@@ -1029,8 +1029,8 @@ export default function App() {
       <header className="border-b border-zinc-800/80 bg-[#09090b]/80 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-[#3db8ff] rounded-lg flex items-center justify-center shadow-[0_0_15px_rgba(61,184,255,0.4)]">
-              <Film className="w-5 h-5 text-black" />
+            <div className="w-10 h-10 bg-[#3db8ff] rounded-[11px] flex items-center justify-center shadow-[0_0_15px_rgba(61,184,255,0.4)] hover:brightness-105 transition-all duration-300 select-none">
+              <Film className="w-5.5 h-5.5 text-zinc-950" strokeWidth={2.5} />
             </div>
             <div>
               <h1 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
