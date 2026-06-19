@@ -54,7 +54,8 @@ export default function App() {
     showPixelGrid: true,
     compression: 'none',
     startTime: 0,
-    endTime: 10
+    endTime: 10,
+    codeFormat: 'full-header'
   });
 
   const [aspectRatioMode, setAspectRatioMode] = useState<'contain' | 'cover' | 'stretch'>('contain');
@@ -708,6 +709,102 @@ export default function App() {
   const compileArduinoHeader = useMemo(() => {
     if (frames.length === 0) return '// Please load a video or demo animation to compile code.';
 
+    const format = settings.codeFormat || 'full-header';
+
+    const getRawBytesCode = () => {
+      let code = '';
+      if (settings.compression === 'none') {
+        frames.forEach((frame, fIdx) => {
+          const packed = packFrame(frame.pixels, settings.packingMode, false);
+          if (format === 'csv-values' || format === 'python-list') {
+            for (let i = 0; i < packed.length; i++) {
+              const hex = '0x' + packed[i].toString(16).toUpperCase().padStart(2, '0');
+              code += hex;
+              if (!(fIdx === frames.length - 1 && i === packed.length - 1)) {
+                code += (i + 1) % 16 === 0 ? ',\n  ' : ', ';
+              }
+            }
+          } else {
+            code += `  { // Frame ${fIdx + 1}\n    `;
+            for (let i = 0; i < packed.length; i++) {
+              const hex = '0x' + packed[i].toString(16).toUpperCase().padStart(2, '0');
+              code += hex;
+              if (i !== packed.length - 1) {
+                code += (i + 1) % 16 === 0 ? ',\n    ' : ', ';
+              }
+            }
+            code += `\n  }${fIdx !== frames.length - 1 ? ',' : ''}\n`;
+          }
+        });
+      } else {
+        const rleSizes: number[] = [];
+        const frameNames: string[] = [];
+
+        frames.forEach((frame, fIdx) => {
+          const packed = packFrame(frame.pixels, settings.packingMode, false);
+          const rleBytes = compressRLE(packed);
+          rleSizes.push(rleBytes.length);
+          
+          const fName = `${exporterName}_frame_${fIdx}`;
+          frameNames.push(fName);
+
+          if (format === 'csv-values' || format === 'python-list') {
+            for (let i = 0; i < rleBytes.length; i++) {
+              const hex = '0x' + rleBytes[i].toString(16).toUpperCase().padStart(2, '0');
+              code += hex;
+              if (!(fIdx === frames.length - 1 && i === rleBytes.length - 1)) {
+                code += (i + 1) % 16 === 0 ? ',\n  ' : ', ';
+              }
+            }
+          } else {
+            code += `const unsigned char ${fName}[] PROGMEM = {\n  `;
+            for (let i = 0; i < rleBytes.length; i++) {
+              const hex = '0x' + rleBytes[i].toString(16).toUpperCase().padStart(2, '0');
+              code += hex;
+              if (i !== rleBytes.length - 1) {
+                code += (i + 1) % 16 === 0 ? ',\n  ' : ', ';
+              }
+            }
+            code += `\n};\n\n`;
+          }
+        });
+
+        if (format !== 'csv-values' && format !== 'python-list') {
+          code += `// Sizes of each RLE compressed frame\n`;
+          code += `const unsigned int ${exporterName}_rle_sizes[${frames.length}] = {\n  `;
+          code += rleSizes.join(', ') + `\n};\n\n`;
+
+          code += `// Multi-dimensional lookup pointer index table\n`;
+          code += `const unsigned char* const ${exporterName}_rle[${frames.length}] PROGMEM = {\n  `;
+          code += frameNames.join(',\n  ') + `\n};\n`;
+        }
+      }
+      return code;
+    };
+
+    if (format === 'csv-values') {
+      return `// Comma-separated hex values for ${frames.length} frame(s)\n// Total size: ${settings.compression === 'none' ? frames.length * 1024 : 'Variable RLE'} bytes\n// Format: ${settings.packingMode}, Compression: ${settings.compression}\n\n  ` + getRawBytesCode();
+    }
+
+    if (format === 'python-list') {
+      return `# Python list format for ${frames.length} frame(s)\n# Total size: ${settings.compression === 'none' ? frames.length * 1024 : 'Variable RLE'} bytes\n# Format: ${settings.packingMode}, Compression: ${settings.compression}\n\n${exporterName}_frames = [\n  ` + getRawBytesCode() + `\n]`;
+    }
+
+    if (format === 'array-only') {
+      let code = `// ${frames.length} Frame(s) compiled with variable: ${exporterName}\n`;
+      code += `// Packing Mode: ${settings.packingMode === 'horizontal' ? 'Horizontal' : 'Vertical-Page'}\n`;
+      code += `// Compression: ${settings.compression}\n\n`;
+      if (settings.compression === 'none') {
+        code += `const unsigned char ${exporterName}[${frames.length}][1024] PROGMEM = {\n`;
+        code += getRawBytesCode();
+        code += `};\n`;
+      } else {
+        code += getRawBytesCode();
+      }
+      return code;
+    }
+
+    // Default 'full-header' format
     let code = `/**\n * PixieStream SSD1306 Video Converter Output\n`;
     code += ` * Generated: ${new Date().toISOString()}\n`;
     code += ` * Frames: ${frames.length}\n`;
@@ -723,65 +820,17 @@ export default function App() {
     code += `const int animation_fps = ${settings.fps};\n\n`;
 
     if (settings.compression === 'none') {
-      // Raw Mode format: animation[Z][1024]
       code += `// Total animation size: ${frames.length * 1024} bytes\n`;
       code += `const unsigned char ${exporterName}[${frames.length}][1024] PROGMEM = {\n`;
-
-      frames.forEach((frame, fIdx) => {
-        const packed = packFrame(frame.pixels, settings.packingMode, false); // inversion taken care during UI settings state
-        code += `  { // Frame ${fIdx + 1}\n    `;
-        
-        for (let i = 0; i < packed.length; i++) {
-          const hex = '0x' + packed[i].toString(16).toUpperCase().padStart(2, '0');
-          code += hex;
-          if (i !== packed.length - 1) {
-            code += (i + 1) % 16 === 0 ? ',\n    ' : ', ';
-          }
-        }
-        
-        code += `\n  }${fIdx !== frames.length - 1 ? ',' : ''}\n`;
-      });
+      code += getRawBytesCode();
       code += `};\n`;
     } else {
-      // RLE Compressed Mode: custom pointers and dynamic size allocations
-      code += `// RLE Compressed Arrays\n`;
-      
-      const rleSizes: number[] = [];
-      const frameNames: string[] = [];
-
-      frames.forEach((frame, fIdx) => {
-        const packed = packFrame(frame.pixels, settings.packingMode, false);
-        const rleBytes = compressRLE(packed);
-        rleSizes.push(rleBytes.length);
-        
-        const fName = `${exporterName}_frame_${fIdx}`;
-        frameNames.push(fName);
-
-        code += `const unsigned char ${fName}[] PROGMEM = {\n  `;
-        for (let i = 0; i < rleBytes.length; i++) {
-          const hex = '0x' + rleBytes[i].toString(16).toUpperCase().padStart(2, '0');
-          code += hex;
-          if (i !== rleBytes.length - 1) {
-            code += (i + 1) % 16 === 0 ? ',\n  ' : ', ';
-          }
-        }
-        code += `\n};\n\n`;
-      });
-
-      // Sizes index array
-      code += `// Sizes of each RLE compressed frame\n`;
-      code += `const unsigned int ${exporterName}_rle_sizes[${frames.length}] = {\n  `;
-      code += rleSizes.join(', ') + `\n};\n\n`;
-
-      // Array pointers
-      code += `// Multi-dimensional lookup pointer index table\n`;
-      code += `const unsigned char* const ${exporterName}_rle[${frames.length}] PROGMEM = {\n  `;
-      code += frameNames.join(',\n  ') + `\n};\n`;
+      code += getRawBytesCode();
     }
 
     code += `\n#endif // PIXIE_STREAM_H\n`;
     return code;
-  }, [frames, settings.packingMode, settings.compression, settings.fps, exporterName]);
+  }, [frames, settings.packingMode, settings.compression, settings.fps, settings.codeFormat, exporterName]);
 
   // Flash Memory consumption indicator
   const statistics = useMemo(() => {
@@ -813,11 +862,16 @@ export default function App() {
   };
 
   const handleDownloadFile = () => {
+    const format = settings.codeFormat || 'full-header';
+    let ext = 'h';
+    if (format === 'python-list') ext = 'py';
+    if (format === 'csv-values') ext = 'txt';
+
     const blob = new Blob([compileArduinoHeader], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${exporterName}.h`;
+    link.download = `${exporterName}.${ext}`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -1722,7 +1776,7 @@ export default function App() {
                       </div>
 
                       {/* Exporter Custom Parameters */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs font-medium">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs font-medium">
                         <div>
                           <label className="block text-zinc-400 mb-1">C Variable Array Token Name</label>
                           <input
@@ -1742,6 +1796,20 @@ export default function App() {
                           >
                             <option value="horizontal">Horizontal (Adafruit_GFX Standard)</option>
                             <option value="vertical-page">Page Vertical format (direct SSD1306/U8g2)</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-zinc-400 mb-1">Code / Data Output Option</label>
+                          <select
+                            value={settings.codeFormat || 'full-header'}
+                            onChange={(e) => setSettings(prev => ({ ...prev, codeFormat: e.target.value as any }))}
+                            className="w-full bg-zinc-905 text-zinc-200 border border-[#3db8ff]/30 rounded-lg p-2.5 text-xs focus:outline-none focus:border-[#3db8ff] font-medium font-sans text-white focus:ring-1 focus:ring-[#3db8ff]"
+                          >
+                            <option value="full-header">Full C/C++ Header (.h)</option>
+                            <option value="array-only">C Array Values Only</option>
+                            <option value="csv-values">Comma-Separated Hex Values (.txt)</option>
+                            <option value="python-list">Python List Format (.py)</option>
                           </select>
                         </div>
                       </div>
@@ -1770,7 +1838,7 @@ export default function App() {
                             className="p-2 text-black bg-[#3db8ff] hover:bg-[#2da1e6] transition-all rounded-lg flex items-center gap-1.5 text-xs font-bold shadow-[0_0_15px_rgba(61,184,255,0.25)] cursor-pointer"
                           >
                             <Download className="w-4 h-4 text-black font-bold" />
-                            <span>Download {exporterName}.h</span>
+                            <span>Download {exporterName}.{settings.codeFormat === 'python-list' ? 'py' : settings.codeFormat === 'csv-values' ? 'txt' : 'h'}</span>
                           </button>
                         </div>
 

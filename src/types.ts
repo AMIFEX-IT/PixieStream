@@ -23,4 +23,5 @@ export interface ConverterSettings {
   compression: 'none' | 'rle';
   startTime: number;
   endTime: number;
+  codeFormat?: 'full-header' | 'array-only' | 'csv-values' | 'python-list';
 }
