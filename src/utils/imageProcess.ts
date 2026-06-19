@@ -306,3 +306,61 @@ export function compressRLE(packedFrame: Uint8Array): Uint8Array {
 
   return new Uint8Array(result);
 }
+
+/**
+ * Unpacks 1024 bytes back into a 128x64 monochromatic pixel array (8192 bytes).
+ */
+export function unpackFrame(
+  packed: Uint8Array,
+  mode: PackingMode
+): Uint8Array {
+  const pixels = new Uint8Array(128 * 64);
+
+  if (mode === 'horizontal') {
+    let byteIdx = 0;
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 128; x += 8) {
+        if (byteIdx >= packed.length) break;
+        const byteVal = packed[byteIdx++];
+        for (let b = 0; b < 8; b++) {
+          const pixelIdx = y * 128 + (x + b);
+          pixels[pixelIdx] = (byteVal & (1 << (7 - b))) ? 1 : 0;
+        }
+      }
+    }
+  } else {
+    let byteIdx = 0;
+    for (let page = 0; page < 8; page++) {
+      for (let x = 0; x < 128; x++) {
+        if (byteIdx >= packed.length) break;
+        const byteVal = packed[byteIdx++];
+        for (let b = 0; b < 8; b++) {
+          const y = page * 8 + b;
+          const pixelIdx = y * 128 + x;
+          pixels[pixelIdx] = (byteVal & (1 << b)) ? 1 : 0;
+        }
+      }
+    }
+  }
+
+  return pixels;
+}
+
+/**
+ * Decompresses an RLE byte array back to its packed size.
+ */
+export function decompressRLE(rleBytes: Uint8Array, expectedSize: number): Uint8Array {
+  const unpacked = new Uint8Array(expectedSize);
+  let pos = 0;
+  for (let i = 0; i < rleBytes.length; i += 2) {
+    if (i + 1 >= rleBytes.length) break;
+    const count = rleBytes[i];
+    const value = rleBytes[i + 1];
+    for (let c = 0; c < count; c++) {
+      if (pos < expectedSize) {
+        unpacked[pos++] = value;
+      }
+    }
+  }
+  return unpacked;
+}

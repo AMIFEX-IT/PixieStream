@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Frame, OledColorStyle, DitheringType, PackingMode, ConverterSettings } from './types';
-import { binarizeImageData, packFrame, compressRLE } from './utils/imageProcess';
+import { binarizeImageData, packFrame, compressRLE, unpackFrame, decompressRLE } from './utils/imageProcess';
 import HelpGuides from './components/HelpGuides';
 
 export default function App() {
@@ -38,7 +38,7 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [isExtracting, setIsExtracting] = useState<boolean>(false);
   const [extractionProgress, setExtractionProgress] = useState<number>(0);
-  const [originalFrames, setOriginalFrames] = useState<{ index: number; originalImageData: ImageData }[]>([]);
+  const [originalFrames, setOriginalFrames] = useState<Frame[]>([]);
   const [frames, setFrames] = useState<Frame[]>([]);
   
   // Settings & Parameters
@@ -77,6 +77,7 @@ export default function App() {
   const [exporterName, setExporterName] = useState<string>('animation');
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [videoMetaData, setVideoMetaData] = useState<{ name: string; duration: number; width: number; height: number } | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // References
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -90,7 +91,7 @@ export default function App() {
     
     setTimeout(() => {
       setExtractionProgress(40);
-      const demoFrames: { index: number; originalImageData: ImageData }[] = [];
+      const demoFrames: Frame[] = [];
       const canvas = document.createElement('canvas');
       canvas.width = 128;
       canvas.height = 64;
@@ -185,9 +186,19 @@ export default function App() {
         ctx.fillText(`Z: ${(cosX * 90).toFixed(0)}*`, 83, 56);
 
         const img = ctx.getImageData(0, 0, 128, 64);
+        const binPixels = binarizeImageData(
+          img,
+          128,
+          64,
+          settings.threshold,
+          settings.dithering,
+          settings.brightness,
+          settings.contrast
+        );
         demoFrames.push({
           index: f,
-          originalImageData: img
+          pixels: binPixels,
+          isEdited: false
         });
       }
 
@@ -200,25 +211,7 @@ export default function App() {
       setOriginalFrames(demoFrames);
       setExtractionProgress(90);
 
-      // Perform initial binarization
-      const initFrames = demoFrames.map((raw) => {
-        const binPixels = binarizeImageData(
-          raw.originalImageData,
-          128,
-          64,
-          settings.threshold,
-          settings.dithering,
-          settings.brightness,
-          settings.contrast
-        );
-        return {
-          index: raw.index,
-          pixels: binPixels,
-          isEdited: false
-        };
-      });
-
-      setFrames(initFrames);
+      setFrames(demoFrames);
       setIsExtracting(false);
       setCurrentFrameIndex(0);
     }, 800);
@@ -258,10 +251,31 @@ export default function App() {
   };
 
   const handleVideoSelect = (file: File) => {
-    if (!file.type.startsWith('video/')) {
-      alert("Please upload a valid .mp4, .mov or webm video file.");
+    setErrorMessage(null);
+    const extension = file.name.split('.').pop()?.toLowerCase();
+
+    if (extension === 'pixie') {
+      handleLoadPixieFile(file);
       return;
     }
+
+    const isVideoType = file.type.startsWith('video/');
+    const commonVideoExtensions = [
+      'mp4', 'mov', 'webm', 'ogg', 'ogv', 'avi', 'mkv', 'flv', 
+      'wmv', 'm4v', '3gp', 'ts', '3g2', 'mj2', 'divx', 'mpg', 
+      'mpeg', 'asf', 'vob', 'm2ts', 'h264', 'h265', 'rmvb', 'rm'
+    ];
+    const isVideoExtension = extension ? commonVideoExtensions.includes(extension) : false;
+
+    // We allow typical video files, but verify to screen out non-video formats
+    const documentOrImageExtensions = ['pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar', 'txt', 'doc', 'docx', 'xls', 'xlsx'];
+    const isDocOrImg = extension ? documentOrImageExtensions.includes(extension) : false;
+
+    if (isDocOrImg) {
+      setErrorMessage(`The selected file "${file.name}" appears to be a document or image, not a video. Please select a valid video file.`);
+      return;
+    }
+
     setVideoFile(file);
     const url = URL.createObjectURL(file);
     setVideoUrl(url);
@@ -269,7 +283,14 @@ export default function App() {
     // Read meta from native element
     const tempVideo = document.createElement('video');
     tempVideo.src = url;
+
+    // Set a timeout to notify if parsing/loading takes too long
+    const metadataTimeout = setTimeout(() => {
+      setErrorMessage(`Warning: "${file.name}" is taking a long time to load. This video might be utilizing an advanced codec (e.g. HEVC/H.265, AV1, or AVI/MKV encapsulation) not natively supported on some web browser setups. If seeking stalls, convert the video file to standard H.264 MP4 format.`);
+    }, 4500);
+
     tempVideo.onloadedmetadata = () => {
+      clearTimeout(metadataTimeout);
       setVideoMetaData({
         name: file.name,
         duration: tempVideo.duration,
@@ -277,35 +298,59 @@ export default function App() {
         height: tempVideo.videoHeight
       });
       // Set end trim time automatically to full video or limit to 15s to save SRAM
+      const calculatedEnd = Math.min(tempVideo.duration, 15);
       setSettings(prev => ({
         ...prev,
         startTime: 0,
-        endTime: Math.min(tempVideo.duration, 15)
+        endTime: calculatedEnd
       }));
+      // Automatically trigger frame extraction upon successful selection
+      triggerExtraction(url, 0, calculatedEnd, settings.fps);
+    };
+
+    tempVideo.onerror = () => {
+      clearTimeout(metadataTimeout);
+      setErrorMessage(`Error: Your browser is unable to decode or playback "${file.name}". Web browsers have limited native support for advanced containers (like MKV, AVI, FLV) or some specific hardware codecs. We strongly recommend converting this file to universally supported MP4 (H.264 + AAC) or WebM first.`);
     };
   };
 
   // Video Frame Extraction loop
-  const triggerExtraction = async () => {
-    if (!videoUrl) return;
+  const triggerExtraction = async (
+    overrideUrl?: string,
+    overrideStartTime?: number,
+    overrideEndTime?: number,
+    overrideFps?: number
+  ) => {
+    const activeUrl = overrideUrl || videoUrl;
+    if (!activeUrl) return;
     setIsExtracting(true);
     setExtractionProgress(0);
 
     const tempVideo = document.createElement('video');
-    tempVideo.src = videoUrl;
+    tempVideo.src = activeUrl;
     tempVideo.muted = true;
     tempVideo.playsInline = true;
     tempVideo.crossOrigin = 'anonymous';
 
     await new Promise<void>((resolve) => {
-      tempVideo.onloadedmetadata = () => resolve();
+      let resolved = false;
+      const done = () => {
+        if (!resolved) {
+          resolved = true;
+          resolve();
+        }
+      };
+      tempVideo.onloadedmetadata = done;
+      tempVideo.onerror = done;
+      setTimeout(done, 3000); // 3-second absolute safety fallback
     });
 
     const duration = tempVideo.duration;
-    const start = Math.max(0, settings.startTime);
-    const end = Math.min(duration, settings.endTime);
+    const start = overrideStartTime !== undefined ? overrideStartTime : Math.max(0, settings.startTime);
+    const end = overrideEndTime !== undefined ? overrideEndTime : Math.min(duration, settings.endTime);
+    const fps = overrideFps !== undefined ? overrideFps : settings.fps;
     const trimDuration = end - start;
-    const numFrames = Math.max(1, Math.floor(trimDuration * settings.fps));
+    const numFrames = Math.max(1, Math.floor(trimDuration * fps));
 
     const canvas = document.createElement('canvas');
     canvas.width = 128;
@@ -316,11 +361,11 @@ export default function App() {
       return;
     }
 
-    const tempFrames: { index: number; originalImageData: ImageData }[] = [];
+    const tempFrames: Frame[] = [];
 
     // Seek and snap loop
     for (let f = 0; f < numFrames; f++) {
-      const seekTarget = start + (f / settings.fps);
+      const seekTarget = start + (f / fps);
       tempVideo.currentTime = seekTarget;
 
       await new Promise<void>((resolve) => {
@@ -371,67 +416,46 @@ export default function App() {
 
       ctx.drawImage(tempVideo, dx, dy, dw, dh);
       const imgData = ctx.getImageData(0, 0, 128, 64);
+      const binPixels = binarizeImageData(
+        imgData,
+        128,
+        64,
+        settings.threshold,
+        settings.dithering,
+        settings.brightness,
+        settings.contrast
+      );
+
       tempFrames.push({
         index: f,
-        originalImageData: imgData
+        pixels: binPixels,
+        isEdited: false
       });
 
       setExtractionProgress(Math.round(((f + 1) / numFrames) * 100));
     }
 
     setOriginalFrames(tempFrames);
-
-    // Initial 1-pin binarization
-    const resultFrames = tempFrames.map((raw) => {
-      const binPixels = binarizeImageData(
-        raw.originalImageData,
-        128,
-        64,
-        settings.threshold,
-        settings.dithering,
-        settings.brightness,
-        settings.contrast
-      );
-      return {
-        index: raw.index,
-        pixels: binPixels,
-        isEdited: false
-      };
-    });
-
-    setFrames(resultFrames);
+    setFrames(tempFrames);
     setIsExtracting(false);
     setCurrentFrameIndex(0);
   };
 
-  // Instantly re-binarize when dynamic sliders update (Threshold, Contrast, Brightness, Dither)
-  // This is run instantly on the current frame, and batched or executed when requested.
-  // To keep responsiveness 100% flawless, let's automatically run it for all frames when settings update!
+  // Instantly apply watermarks on top of original 1-bit frames
   useEffect(() => {
     if (originalFrames.length === 0) return;
 
     const updated = originalFrames.map((raw) => {
       // If the user already manually edited this frame using direct pencil tool, we should
-      // preserve their custom pencil design instead of overwriting! Or we can overwrite
-      // only if it's not edited. Let's inspect isEdited.
+      // preserve their custom pencil design instead of overwriting!
       const currentFrameRef = frames.find(f => f.index === raw.index);
       if (currentFrameRef?.isEdited) {
-        return currentFrameRef; // preserve the customized drawing
+        return currentFrameRef; 
       }
-
-      const binPixels = binarizeImageData(
-        raw.originalImageData,
-        128,
-        64,
-        settings.threshold,
-        settings.dithering,
-        settings.brightness,
-        settings.contrast
-      );
 
       return {
         index: raw.index,
-        pixels: binPixels,
+        pixels: new Uint8Array(raw.pixels),
         isEdited: false
       };
     });
@@ -443,11 +467,8 @@ export default function App() {
 
     setFrames(updated);
   }, [
-    settings.threshold,
-    settings.dithering,
-    settings.brightness,
-    settings.contrast,
-    aspectRatioMode,
+    watermarkText,
+    watermarkPosition,
     originalFrames
   ]);
 
@@ -513,20 +534,10 @@ export default function App() {
     const currentRaw = originalFrames.find(f => f.index === currentFrameIndex);
     if (!currentRaw) return;
 
-    const resettedPixels = binarizeImageData(
-      currentRaw.originalImageData,
-      128,
-      64,
-      settings.threshold,
-      settings.dithering,
-      settings.brightness,
-      settings.contrast
-    );
-
     const updated = [...frames];
     updated[currentFrameIndex] = {
       index: currentFrameIndex,
-      pixels: resettedPixels,
+      pixels: new Uint8Array(currentRaw.pixels),
       isEdited: false
     };
     setFrames(updated);
@@ -813,6 +824,191 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const handleDownloadPixie = () => {
+    if (frames.length === 0) return;
+    
+    let totalSize = 13;
+    const frameDataArray: Uint8Array[] = [];
+
+    frames.forEach((frame) => {
+      const packed = packFrame(frame.pixels, settings.packingMode, false);
+      if (settings.compression === 'none') {
+        totalSize += 1024;
+        frameDataArray.push(packed);
+      } else {
+        const rleBytes = compressRLE(packed);
+        totalSize += 2 + rleBytes.length; // 2 bytes for length
+        frameDataArray.push(rleBytes);
+      }
+    });
+
+    const arrayBuffer = new ArrayBuffer(totalSize);
+    const dataView = new DataView(arrayBuffer);
+    const uint8View = new Uint8Array(arrayBuffer);
+
+    // Setup "PIXIE" header signature (5 bytes)
+    uint8View.set([80, 73, 88, 73, 69], 0);
+    // Version = 1 (1 byte)
+    dataView.setUint8(5, 1);
+    // Width = 128 (1 byte)
+    dataView.setUint8(6, 128);
+    // Height = 64 (1 byte)
+    dataView.setUint8(7, 64);
+    // num_frames (2 bytes)
+    dataView.setUint16(8, frames.length, true);
+    // fps (1 byte)
+    dataView.setUint8(10, settings.fps);
+    // packingMode (1 byte, 0 = horizontal, 1 = vertical-page)
+    dataView.setUint8(11, settings.packingMode === 'horizontal' ? 0 : 1);
+    // compression (1 byte, 0 = none, 1 = rle)
+    dataView.setUint8(12, settings.compression === 'none' ? 0 : 1);
+
+    let offset = 13;
+    frameDataArray.forEach((data) => {
+      if (settings.compression === 'none') {
+        uint8View.set(data, offset);
+        offset += data.length;
+      } else {
+        dataView.setUint16(offset, data.length, true);
+        offset += 2;
+        uint8View.set(data, offset);
+        offset += data.length;
+      }
+    });
+
+    const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${exporterName}.pixie`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleLoadPixieFile = (file: File) => {
+    setErrorMessage(null);
+    setIsExtracting(true);
+    setExtractionProgress(10);
+    
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const buffer = e.target?.result as ArrayBuffer;
+        if (!buffer) {
+          throw new Error('Could not read file data');
+        }
+        
+        if (buffer.byteLength < 13) {
+          throw new Error('Invalid .pixie file (file is too small)');
+        }
+        
+        const dataView = new DataView(buffer);
+        const uint8View = new Uint8Array(buffer);
+        
+        // Match magic
+        let magic = '';
+        for (let i = 0; i < 5; i++) {
+          magic += String.fromCharCode(uint8View[i]);
+        }
+        
+        if (magic !== 'PIXIE') {
+          throw new Error('Invalid .pixie file: signature does not match PIXIE');
+        }
+        
+        const version = dataView.getUint8(5);
+        if (version !== 1) {
+          throw new Error(`Unsupported .pixie version: ${version}`);
+        }
+        
+        const width = dataView.getUint8(6);
+        const height = dataView.getUint8(7);
+        if (width !== 128 || height !== 64) {
+          throw new Error(`Unsupported screen size: ${width}x${height}. Only 128x64 is supported.`);
+        }
+        
+        const frameCount = dataView.getUint16(8, true);
+        const fps = dataView.getUint8(10);
+        const packingModeVal = dataView.getUint8(11);
+        const compressionVal = dataView.getUint8(12);
+        
+        const packingMode: PackingMode = packingModeVal === 0 ? 'horizontal' : 'vertical-page';
+        const compression: 'none' | 'rle' = compressionVal === 0 ? 'none' : 'rle';
+        
+        const importedFrames: Frame[] = [];
+        let offset = 13;
+        
+        for (let f = 0; f < frameCount; f++) {
+          let binPixels: Uint8Array;
+          
+          if (compression === 'none') {
+            const size = 1024;
+            if (offset + size > buffer.byteLength) {
+              throw new Error(`Corrupted raw data: frame ${f + 1} exceeds file length`);
+            }
+            const packed = new Uint8Array(buffer, offset, size);
+            offset += size;
+            binPixels = unpackFrame(packed, packingMode);
+          } else {
+            if (offset + 2 > buffer.byteLength) {
+              throw new Error(`Corrupted RLE data: frame ${f + 1} length exceeds file length`);
+            }
+            const rleLen = dataView.getUint16(offset, true);
+            offset += 2;
+            
+            if (offset + rleLen > buffer.byteLength) {
+              throw new Error(`Corrupted RLE data: frame ${f + 1} body exceeds file length`);
+            }
+            const rleData = new Uint8Array(buffer, offset, rleLen);
+            offset += rleLen;
+            
+            const packed = decompressRLE(rleData, 1024);
+            binPixels = unpackFrame(packed, packingMode);
+          }
+          
+          importedFrames.push({
+            index: f,
+            pixels: binPixels,
+            isEdited: false
+          });
+          
+          setExtractionProgress(Math.round(((f + 1) / frameCount) * 100));
+        }
+        
+        setExporterName(file.name.replace(/\.pixie$/, '').replace(/[^a-zA-Z0-9_]/g, ''));
+        setSettings(prev => ({
+          ...prev,
+          fps: fps,
+          packingMode: packingMode,
+          compression: compression,
+          startTime: 0,
+          endTime: Math.min(frameCount / fps, 15)
+        }));
+        
+        setVideoMetaData({
+          name: file.name,
+          duration: frameCount / fps,
+          width: 128,
+          height: 64
+        });
+        
+        setOriginalFrames(importedFrames);
+        setFrames(importedFrames);
+        setIsExtracting(false);
+        setCurrentFrameIndex(0);
+      } catch (err: any) {
+        setIsExtracting(false);
+        setErrorMessage(err.message || 'Error occurred while loading .pixie file');
+      }
+    };
+    reader.onerror = () => {
+      setIsExtracting(false);
+      setErrorMessage('Failed to read .pixie file');
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
   const handleResetConverter = () => {
     setVideoFile(null);
     setVideoUrl('');
@@ -821,6 +1017,7 @@ export default function App() {
     setVideoMetaData(null);
     setCurrentFrameIndex(0);
     setIsPlaying(false);
+    setErrorMessage(null);
   };
 
   return (
@@ -901,7 +1098,17 @@ export default function App() {
             >
               {/* Empty & Video Dropbox State */}
               {frames.length === 0 && !isExtracting && (
-                <div className="max-w-2xl mx-auto mt-8">
+                <div className="max-w-2xl mx-auto mt-8 space-y-4">
+                  {errorMessage && (
+                    <div className="p-4 bg-red-950/20 border border-red-900/40 rounded-2xl flex items-start gap-3 text-red-200 text-xs shadow-md animate-pulse">
+                      <Info className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                      <div className="space-y-1">
+                        <p className="font-bold text-white uppercase tracking-wider text-[10px]">Codec / Format Notice</p>
+                        <p className="leading-relaxed">{errorMessage}</p>
+                      </div>
+                    </div>
+                  )}
+
                   <div
                     ref={dropZoneRef}
                     onDragOver={handleDragOver}
@@ -911,16 +1118,16 @@ export default function App() {
                   >
                     <input
                       type="file"
-                      accept="video/*"
+                      accept="video/*, .mp4, .mov, .mkv, .avi, .webm, .flv, .3gp, .h264, .wmv, .mpeg, .pixie"
                       onChange={handleFileChange}
                       className="absolute inset-0 opacity-0 cursor-pointer"
                     />
                     <div className="w-16 h-16 bg-zinc-900 rounded-2xl flex items-center justify-center mx-auto mb-6 border border-zinc-800 group-hover:scale-105 transition-transform shadow-[0_0_15px_rgba(61,184,255,0.05)]">
                       <Upload className="w-8 h-8 text-[#3db8ff] group-hover:text-[#3db8ff]/80" />
                     </div>
-                    <h3 className="text-lg font-semibold text-white tracking-tight">Convert Video for SSD1306 Display</h3>
+                    <h3 className="text-lg font-semibold text-white tracking-tight">Convert Video / Load .pixie File</h3>
                     <p className="text-sm text-zinc-500 mt-2 max-w-md mx-auto">
-                      Drag and drop your local <span className="text-zinc-350">.mp4</span> or <span className="text-zinc-350">.mov</span> video file here, or click to browse.
+                      Drag and drop any video file or saved <span className="text-[#3db8ff] font-medium">.pixie</span> animation here, or click to browse.
                     </p>
                     <div className="mt-8 flex flex-wrap justify-center gap-3">
                       <button
@@ -1541,7 +1748,7 @@ export default function App() {
 
                       {/* Visual Header Output precode block */}
                       <div className="relative">
-                        <div className="absolute right-4 top-4 flex gap-2">
+                        <div className="absolute right-4 top-4 flex gap-2 flex-wrap justify-end">
                           <button
                             onClick={handleCopyCode}
                             className="p-2 text-zinc-400 hover:text-white bg-zinc-900 border border-zinc-800 hover:border-zinc-700 transition-colors rounded-lg flex items-center gap-1.5 text-xs cursor-pointer font-bold"
@@ -1550,6 +1757,14 @@ export default function App() {
                             <span>{copiedCode ? 'Copied!' : 'Copy Code'}</span>
                           </button>
                           
+                          <button
+                            onClick={handleDownloadPixie}
+                            className="p-2 text-white bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/40 transition-all rounded-lg flex items-center gap-1.5 text-xs font-bold shadow-[0_0_15px_rgba(99,102,241,0.3)] cursor-pointer"
+                          >
+                            <Sparkles className="w-4 h-4 text-indigo-200 font-bold" />
+                            <span>Convert to .pixie</span>
+                          </button>
+
                           <button
                             onClick={handleDownloadFile}
                             className="p-2 text-black bg-[#3db8ff] hover:bg-[#2da1e6] transition-all rounded-lg flex items-center gap-1.5 text-xs font-bold shadow-[0_0_15px_rgba(61,184,255,0.25)] cursor-pointer"
