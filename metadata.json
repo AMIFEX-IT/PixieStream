@@ -1,0 +1,6 @@
+{
+  "name": "PixieStream",
+  "description": "Convert video files into 1-bit monochromatic C/C++ PROGMEM hex arrays formatted for SSD1306 (128x64) OLED displays.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
